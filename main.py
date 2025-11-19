@@ -56,7 +56,24 @@ def main():
             print("❌ 无效的模式选择")
             return
 
-        brain = BrainBatchAlpha()
+        brain = None
+
+        if mode in [1, 2]:
+            # 在启动时由用户输入 maxconcurrent
+            try:
+                maxconcurrent = int(input("\n请输入并发测试的最大数量 maxConcurrent (>=1): "))
+                if maxconcurrent <= 0:
+                    print("⚠️ 并发数量必须 >= 1，已自动设置为 1")
+                    maxconcurrent = 1
+            except Exception:
+                print("⚠️ 输入非法，使用默认并发数 1")
+                maxconcurrent = 1
+
+            brain = BrainBatchAlpha(maxconcurrent=maxconcurrent)
+
+        else:
+            # 仅提交模式不需要并发测试，使用默认并发数 1
+            brain = BrainBatchAlpha()
 
         if mode in [1, 2]:
             print("\n📊 可用数据集列表:")
@@ -70,15 +87,16 @@ def main():
                 return
 
             print("\n📈 可用策略模式:")
-            print("1: 基础策略模式")
-            print("2: 多因子组合模式")
+            print("1: vec策略模式")
+            print("2: matrix策略模式")
 
             strategy_mode = int(input("\n请选择策略模式 (1-2): "))
             if strategy_mode not in [1, 2]:
                 print("❌ 无效的策略模式")
                 return
 
-            results = brain.simulate_alphas(None, strategy_mode, dataset_name)
+            type = 'MATRIX' if strategy_mode == 2 else 'VEC'
+            results = brain.simulate_alphas(None, strategy_mode, dataset_name, type)
 
             if mode == 1:
                 submit_alpha_ids(brain, 2)

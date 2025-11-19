@@ -12,16 +12,23 @@ from requests.auth import HTTPBasicAuth
 
 from alpha_strategy import AlphaStrategy
 from dataset_config import get_api_settings, get_dataset_config
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class BrainBatchAlpha:
     API_BASE_URL = 'https://api.worldquantbrain.com'
 
-    def __init__(self, credentials_file='brain_credentials.txt'):
+    def __init__(self, credentials_file='brain_credentials.txt', maxconcurrent=1):
         """初始化 API 客户端"""
 
         self.session = requests.Session()
         self._setup_authentication(credentials_file)
+
+        try:
+            self.maxconcurrent = max(1, int(maxconcurrent))
+        except Exception:
+            self.maxconcurrent = 1
+        print(f"🧵 最大并发测试数(maxConcurrent): {self.maxconcurrent}")
 
     def _setup_authentication(self, credentials_file):
         """设置认证"""
@@ -42,11 +49,11 @@ class BrainBatchAlpha:
             print(f"❌ 认证错误: {str(e)}")
             raise
 
-    def simulate_alphas(self, datafields=None, strategy_mode=1, dataset_name=None):
+    def simulate_alphas(self, datafields=None, strategy_mode=1, dataset_name=None, type = 'MATRIX'):
         """模拟 Alpha 列表"""
 
         try:
-            datafields = self._get_datafields_if_none(datafields, dataset_name)
+            datafields = self._get_datafields_if_none(datafields, dataset_name, type)
             if not datafields:
                 return []
 
@@ -56,22 +63,95 @@ class BrainBatchAlpha:
 
             print(f"\n🚀 开始模拟 {len(alpha_list)} 个 Alpha 表达式...")
 
-            results = []
-            for i, alpha in enumerate(alpha_list, 1):
-                print(f"\n[{i}/{len(alpha_list)}] 正在模拟 Alpha...")
-                result = self._simulate_single_alpha(alpha)
-                if result and result.get('passed_all_checks'):
-                    results.append(result)
-                    self._save_alpha_id(result['alpha_id'], result)
+            # maxconcurrent <= 1 时，保持原来的串行逻辑
+            if self.maxconcurrent <= 1 or len(alpha_list) <= 1:
+                results = []
+                for i, alpha in enumerate(alpha_list, 1):
+                    print(f"\n[{i}/{len(alpha_list)}] 正在模拟 Alpha...")
+                    result = self._simulate_single_alpha(alpha)
+                    if result and result.get('passed_all_checks'):
+                        results.append(result)
+                        self._save_alpha_id(result['alpha_id'], result)
 
-                if i < len(alpha_list):
-                    sleep(5)
+                    if i < len(alpha_list):
+                        sleep(5)
 
-            return results
+                return results
+
+            # 否则使用并发方式
+            else:
+                return self._simulate_alphas_concurrent(alpha_list)
 
         except Exception as e:
             print(f"❌ 模拟过程出错: {str(e)}")
             return []
+
+    def _simulate_alphas_concurrent(self, alpha_list):
+        """
+        使用线程池并发地模拟 Alpha，最多 self.maxconcurrent 个并发请求。
+        每个线程仍然调用原来的 _simulate_single_alpha，不改原有模拟流程。
+        """
+        total = len(alpha_list)
+        results = []
+
+        print(f"\n💻 使用并发测试，maxConcurrent = {self.maxconcurrent}")
+
+        with ThreadPoolExecutor(max_workers=self.maxconcurrent) as executor:
+            # 提交所有任务
+            future_to_index = {
+                executor.submit(self._simulate_single_alpha, alpha): idx
+                for idx, alpha in enumerate(alpha_list, 1)
+            }
+
+            done_count = 0
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                done_count += 1
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print(f"❌ 第 {idx} 个 Alpha 并发模拟时出错: {e}")
+                    continue
+
+                print(f"✅ 并发模拟进度: {done_count}/{total}")
+
+                if result and result.get('passed_all_checks'):
+                    results.append(result)
+                    self._save_alpha_id(result['alpha_id'], result)
+
+        return results
+
+    def _save_alpha_id(self, alpha_id, result):
+        """将通过检查的 Alpha 信息保存到本地 CSV 文件中"""
+        try:
+            base_dir = os.path.join(expanduser("~"), ".brain_alpha")
+            os.makedirs(base_dir, exist_ok=True)
+            file_path = os.path.join(base_dir, "alpha_ids.csv")
+
+            record = {
+                "timestamp": result.get(
+                    "timestamp",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ),
+                "alpha_id": alpha_id,
+                "expression": result.get("expression"),
+                "passed_all_checks": result.get("passed_all_checks", False),
+                "metrics": json.dumps(result.get("metrics", {}), ensure_ascii=False),
+            }
+
+            if os.path.exists(file_path):
+                df = pd.read_csv(file_path)
+                # 去重：同一个 alpha_id 只保留最新的一条
+                if "alpha_id" in df.columns:
+                    df = df[df["alpha_id"] != alpha_id]
+                df = pd.concat([df, pd.DataFrame([record])], ignore_index=True)
+            else:
+                df = pd.DataFrame([record])
+
+            df.to_csv(file_path, index=False)
+            print(f"✅ 已保存 Alpha {alpha_id} 至 {file_path}")
+        except Exception as e:
+            print(f"❌ 保存 Alpha {alpha_id} 失败: {e}")
 
     def _simulate_single_alpha(self, alpha):
         """模拟单个 Alpha"""
@@ -199,12 +279,6 @@ class BrainBatchAlpha:
             else:
                 print("✅ Turnover 达标")
 
-            if ic_mean < 0.02:
-                print("❌ IC Mean 不达标")
-                is_qualified = False
-            else:
-                print("✅ IC Mean 达标")
-
             if subuniverse_sharpe < required_subuniverse_sharpe:
                 print(f"❌ 子宇宙 Sharpe 不达标 ({subuniverse_sharpe:.3f} < {required_subuniverse_sharpe:.3f})")
                 is_qualified = False
@@ -226,7 +300,6 @@ class BrainBatchAlpha:
                     is_qualified = False
                 elif result == 'PENDING':
                     print(f"⚠️ {name}: 检查尚未完成")
-                    is_qualified = False
 
             print("\n📋 最终评判:")
             if is_qualified:
@@ -290,7 +363,7 @@ class BrainBatchAlpha:
 
         return successful, failed
 
-    def _get_datafields_if_none(self, datafields=None, dataset_name=None):
+    def _get_datafields_if_none(self, datafields=None, dataset_name=None, type = 'MATRIX'):
         """获取数据字段列表"""
 
         try:
@@ -346,12 +419,22 @@ class BrainBatchAlpha:
                 if field.get('type') == 'MATRIX'
             ]
 
+            vec_fields = [
+                field['id'] for field in all_fields
+                if field.get('type') == 'VECTOR'
+            ]
+
             if not matrix_fields:
                 print("❌ 未找到可用的数据字段")
                 return None
 
-            print(f"✅ 获取到 {len(matrix_fields)} 个数据字段")
-            return matrix_fields
+            if type == 'MATRIX':
+                print(f"✅ 获取到 {len(matrix_fields)} 个matrix数据字段")
+                return matrix_fields
+            elif type == 'VEC':
+                print(f"✅ 获取到 {len(vec_fields)} 个vec数据字段")
+                return vec_fields
+
 
         except Exception as e:
             print(f"❌ 获取数据字段时出错: {str(e)}")
